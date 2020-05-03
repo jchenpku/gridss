@@ -87,6 +87,7 @@ info(vcf)$INSRMP=rep(NA_character_, nrow(info(vcf)))
 insseqgr = with(data.frame(
     sourceId=rep(names(rowRanges(vcf)), lengths(info(vcf)$BEALN)),
     BEALN=unlist(info(vcf)$BEALN)) %>%
+  filter(!grepl(":[0-9]+:", BEALN)) %>% # get ride of lines containing multiple ":" such as the HLA loci
   separate(BEALN, sep="[:|]", into=c("chr", "start", "orientation", "cigar", "maqp")) %>%
   mutate(
     start=as.integer(start),
