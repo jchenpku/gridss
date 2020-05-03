@@ -15,6 +15,8 @@ import au.edu.wehi.idsv.visualisation.PositionalExporter;
 import com.google.common.collect.*;
 import htsjdk.samtools.SAMRecord;
 import htsjdk.samtools.util.Log;
+import it.unimi.dsi.fastutil.ints.Int2IntMap;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.*;
 import it.unimi.dsi.fastutil.objects.ObjectOpenCustomHashSet;
@@ -26,6 +28,8 @@ import java.util.*;
 import java.util.Map.Entry;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 
 /**
@@ -93,6 +97,7 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 	private AssemblyChunkTelemetry telemetry = null;
 	private Set<KmerEvidence> untrackedEvidenceStillBeingProcessed = null;
 	public int getReferenceIndex() { return referenceIndex; }
+
 	private int retainWidth() {
 		return  maxContigAnchorLength() + Math.max(
 				// safety check to ensure that flushed contigs don't call advanceUnderlying()
@@ -115,11 +120,29 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 	 *               ---------
 	 *                       ^
 	 *                       |
-	 * Last position supported by this RP is here. 
+	 * Last position supported by this RP is here.
+	 *
+	 * Worst case in opposite direction:
+	 *                V next position
+	 *       SSSSSMDDM-
+	 *   MMMMM
+	 *   - min frag size = 1
+	 *   - short soft clip on anchor
+	 *   - next position will minFragSize
+	 * Since we count starting from the first unclipped base, and our frag size is less than our read length,
+	 * the first kmer of the mate read can be up to twice the read length from the end of the read.
+	 *
+	 *
+	 * Both anchoring read and unmapped mate have the evidenceID.
+	 * This means we can have:
+	 *
+	 * ======= contig
+	 *       ---------- read
+	 *                                         ------- mate placement
+	 *       |---------------------------------------| max frag size
 	 */
 	private int minDistanceFromNextPositionForEvidenceToBeFullyLoaded() {
-		// TODO: work out why maxEvidenceSupportIntervalWidth + aes.getMaxReadLength() - k + 1 isn't sufficient distance
-		return maxEvidenceSupportIntervalWidth + aes.getMaxReadLength() + aes.getMaxConcordantFragmentSize() + 1;
+		return maxEvidenceSupportIntervalWidth + aes.getMaxReadLength() + Math.max(aes.getMaxReadMappedLength(), aes.getMaxConcordantFragmentSize()) + 1;
 	}
 	/**
 	 * Creates a new structural variant positional de Bruijn graph contig assembly for the given chromosome
@@ -262,6 +285,7 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 			verifyMemoization();
 		}
 	}
+
 	private int flushReferenceNodes_debug_message_count = 0;
 	private void flushReferenceNodes() {
 		int endPosition = nonReferenceGraphByPosition.isEmpty() ? nextPosition() : nonReferenceGraphByPosition.first().firstStart();
@@ -376,6 +400,10 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 	 */
 	private void advanceUnderlying(int loadUntil) {
 		if (loadUntil < nextPosition()) return;
+		if (Defaults.SANITY_CHECK_ASSEMBLY_GRAPH) {
+			sanityCheckDisjointNodeIntervals();
+			sanityCheckGraphMatchesEvidence();
+		}
 		lastNextPosition = nextPosition();
 		int count = 0;
 		while (underlying.hasNext() && nextPosition() <= loadUntil) {
@@ -404,7 +432,12 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 			getTelemetry().loadGraph(referenceIndex, lastNextPosition, nextPosition(), count, filtered, currentTime - telemetryLastloadGraphs);
 			telemetryLastloadGraphs = currentTime;
 		}
+		if (Defaults.SANITY_CHECK_ASSEMBLY_GRAPH) {
+			sanityCheckDisjointNodeIntervals();
+			sanityCheckGraphMatchesEvidence();
+		}
 	}
+
 	/**
 	 * Verifies that the memoization matches a freshly calculated memoization
 	 */
@@ -429,6 +462,10 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 	 */
 	private SAMRecord callContig(ArrayDeque<KmerPathSubnode> rawcontig) {
 		if (rawcontig == null) return null;
+		if (Defaults.SANITY_CHECK_ASSEMBLY_GRAPH) {
+			sanityCheckDisjointNodeIntervals();
+			sanityCheckGraphMatchesEvidence();
+		}
 		ArrayDeque<KmerPathSubnode> contig = rawcontig;
 		if (containsKmerRepeat(contig)) {
 			// recalculate the called contig, this may break the contig at the repeated kmer
@@ -482,10 +519,14 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 		Set<KmerEvidence> evidence = evidenceTracker.untrack(contig);
 		untrackedEvidenceStillBeingProcessed = evidence;
 		List<DirectedEvidence> evidenceIds = evidence.stream()
+				// Just the anchoring read of a read pair doesn't count as supporting the contig
+				.filter(ke -> !(ke.isAnchored() && ke.evidence() instanceof NonReferenceReadPair))
 				.map(e -> e.evidence())
 				.collect(Collectors.toList());
 		SupportLookup supportLookup = new SupportLookup(fullContig);
 		List<AssemblyEvidenceSupport> supportList = evidence.stream()
+				// Ignore anchoring KmerEvidence for RP as it's all encoded in the KmerEvidence of the unanchored mate
+				.filter(ke -> !(ke.isAnchored() && ke.evidence() instanceof NonReferenceReadPair))
 				.map(e -> {
 					Range<Integer> si = supportLookup.supportInterval(e);
 					return si == null ? null : new AssemblyEvidenceSupport(e.evidence(), si).adjustForAssemblyTruncation(startBasesToTrim);
@@ -620,6 +661,10 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 			called.add(Pair.of(assembledContig, evidence));
 		}
 		untrackedEvidenceStillBeingProcessed = null;
+		if (Defaults.SANITY_CHECK_ASSEMBLY_GRAPH) {
+			sanityCheckDisjointNodeIntervals();
+			sanityCheckGraphMatchesEvidence();
+		}
 		return assembledContig;
 	}
 
@@ -677,6 +722,58 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 		for (KmerEvidence e : evidence) {
 			updateRemovalList(toRemove, e);
 		}
+		if (Defaults.SANITY_CHECK_ASSEMBLY_GRAPH) {
+			Long2ObjectMap<Int2IntMap> expected = kmerEvidenceToKmerPosWeightLookup(evidence);
+			int totalPositionWeight = 0;
+			for (Entry<KmerPathNode, List<List<KmerNode>>> entry : toRemove.entrySet()) {
+				KmerPathNode kpn = entry.getKey();
+				for (int i = 0; i < kpn.length(); i++) {
+					// Check nodes each KmerPathNode kmer allocation is correct
+					List<KmerNode> toRemoveKmerNodes = new ArrayList();
+					if (entry.getValue().size() > i && entry.getValue().get(i) != null) {
+						toRemoveKmerNodes = entry.getValue().get(i);
+					}
+					int start = kpn.firstStart() + i;
+					int end = kpn.firstEnd() + i;
+					List<Long> kmers = new ArrayList();
+					kmers.add(kpn.kmer(i));
+					for (int j = 0; i < kpn.collapsedKmers().size(); j++) {
+						int collapseOffset = kpn.collapsedKmerOffsets().getInt(j);
+						long collapseKmer = kpn.collapsedKmers().getLong(j);
+						if (collapseOffset == i) {
+							kmers.add(collapseKmer);
+						}
+					}
+					for (KmerNode kn : toRemoveKmerNodes) {
+						assert(IntervalUtil.overlapsClosed(start, end, kn.lastStart(), kn.lastEnd()));
+						assert(kmers.contains(kn.lastKmer()));
+					}
+					for (int pos = start; pos <= end; pos++) {
+						int finalPos = pos;
+						int actualWeight = toRemoveKmerNodes.stream().filter(kn -> kn.lastStart() <= finalPos && kn.lastEnd() >= finalPos).mapToInt(kn -> kn.weight()).sum();
+						int expectedWeight = kmers.stream().
+								map(x -> expected.get((long)x)).
+								filter(x -> x != null).
+								map(x -> x.get(finalPos)).
+								filter(x -> x != null).
+								mapToInt(x -> x).
+								sum();
+						if (actualWeight != expectedWeight) {
+							List<KmerEvidence> overlappingEvidence = evidence.stream()
+									.filter(ke -> IntStream.range(0, ke.length()).filter(
+											j -> kmers.contains(ke.kmer(j)) && IntervalUtil.overlapsClosed(start, end, ke.startPosition() + j, ke.endPosition() + j)).count() > 0)
+									.collect(Collectors.toList());
+							throw new IllegalStateException("Mismatch between actual and expected kmer weights");
+						}
+						totalPositionWeight += actualWeight;
+					}
+				}
+			}
+			int totalExpectedPositionWeight = expected.values().stream().mapToInt(x -> x.values().stream().mapToInt(xx -> xx).sum()).sum();
+			if (totalPositionWeight != totalExpectedPositionWeight) {
+				throw new IllegalStateException("Graph is missing nodes that should be removed");
+			}
+		}
 		if (toRemove.size() > aes.getContext().getAssemblyParameters().positional.forceFullMemoizationRecalculationAt * graphByPosition.size()) {
 			bestContigCaller = null;
 		}
@@ -699,6 +796,7 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 		if (Defaults.SANITY_CHECK_ASSEMBLY_GRAPH) {
 			assert(sanityCheck());
 			assert(sanityCheckDisjointNodeIntervals());
+			assert(sanityCheckGraphMatchesEvidence());
 		}
 		if (Defaults.SANITY_CHECK_MEMOIZATION && bestContigCaller != null) {
 			// Force memoization recalculation now
@@ -710,6 +808,7 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 			initialiseBestCaller();
 		}
 	}
+
 	/**
 	 * Attempts to simplify the given nodes
 	 * @param simplifyCandidates
@@ -1014,6 +1113,118 @@ public class NonReferenceContigAssembler implements Iterator<SAMRecord> {
 		}
 		return true;
 	}
+
+	private boolean sanityCheckGraphMatchesEvidence() {
+		return sanityCheckCompareKmerPosWeights(kmerPathNodeToKmerPosWeightLookup(graphByPosition), kmerEvidenceToKmerPosWeightLookup(evidenceTracker.getTrackedEvidence()), nextPosition());
+	}
+
+	private Long2ObjectMap<Int2IntMap> kmerPathNodeToKmerPosWeightLookup(Collection<KmerPathNode> nodes) {
+		Long2ObjectMap<Int2IntMap> kmerPosWeight = new Long2ObjectOpenHashMap<>();
+		for (KmerPathNode kpn : nodes) {
+			for (int i = 0; i < kpn.length(); i++) {
+				int weight = kpn.weight(i);
+				long kmer = kpn.kmer(i);
+				kmerPosWeight.putIfAbsent(kmer, new Int2IntOpenHashMap());
+				Int2IntMap posWeight = kmerPosWeight.get(kmer);
+				for (int pos = kpn.startPosition(i); pos <= kpn.endPosition(i); pos++) {
+					assert(posWeight.get(pos) == 0);
+					if (pos < nextPosition()) {
+						posWeight.put(pos, weight);
+					}
+				}
+			}
+		}
+		return kmerPosWeight;
+	}
+
+	private Long2ObjectMap<Int2IntMap> kmerEvidenceToKmerPosWeightLookup(Collection<KmerEvidence> evidence) {
+		return kmerNodeToKmerPosWeightLookup(evidence.stream().flatMap(ke -> IntStream.range(0, ke.length()).mapToObj(i -> ke.node(i))));
+	}
+
+	private void addkmerPosWeight(Long2ObjectMap<Int2IntMap> kmerPosWeight, KmerNode kn) {
+		addkmerPosWeight(kmerPosWeight, kn, Integer.MAX_VALUE);
+	}
+	private void addkmerPosWeight(Long2ObjectMap<Int2IntMap> kmerPosWeight, KmerNode kn, int beforePosition) {
+		if (kn == null) return;
+		assert(kn.length() == 1);
+		int weight = kn.weight();
+		long kmer = kn.lastKmer();
+		kmerPosWeight.putIfAbsent(kmer, new Int2IntOpenHashMap());
+		Int2IntMap posWeight = kmerPosWeight.get(kmer);
+		for (int pos = kn.lastStart(); pos <= kn.lastEnd(); pos++) {
+			if (pos < beforePosition) {
+				posWeight.put(pos, posWeight.get(pos) + weight);
+			}
+		}
+	}
+
+	private Long2ObjectMap<Int2IntMap> kmerNodeToKmerPosWeightLookup(Stream<KmerNode> nodes) {
+		Long2ObjectMap<Int2IntMap> kmerPosWeight = new Long2ObjectOpenHashMap<>();
+		nodes.forEach(kn -> addkmerPosWeight(kmerPosWeight, kn));
+		return kmerPosWeight;
+	}
+	private class KmerPosWeightDelta {
+		public final long kmer;
+		public final int pos;
+		public final int expectedWeight;
+		public final int actualWeight;
+		public final Set<KmerEvidence> overlappingEvidence = new HashSet<>();
+		public KmerPosWeightDelta(long kmer, int pos, int expectedWeight, int actualWeight) {
+			this.kmer = kmer;
+			this.pos = pos;
+			this.expectedWeight = expectedWeight;
+			this.actualWeight = actualWeight;
+		}
+	}
+	private boolean sanityCheckCompareKmerPosWeights(Long2ObjectMap<Int2IntMap> expectedKmerPosWeight, Long2ObjectMap<Int2IntMap> actualKmerPosWeight, int maxPosition) {
+		List<KmerPosWeightDelta> mismatches = new ArrayList<>();
+		for (long kmer : Sets.union(actualKmerPosWeight.keySet(), expectedKmerPosWeight.keySet())) {
+			Int2IntMap actualPosWeight = actualKmerPosWeight.getOrDefault(kmer, emptyi2i);
+			Int2IntMap expectedPosWeight = expectedKmerPosWeight.getOrDefault(kmer, emptyi2i);
+			for (int pos : Sets.union(actualPosWeight.keySet(), expectedPosWeight.keySet())) {
+				if (pos < maxPosition) {
+					int actualWeight = actualPosWeight.get(pos);
+					int expectedWeight = expectedPosWeight.get(pos);
+					if (actualWeight != expectedWeight) {
+						mismatches.add(new KmerPosWeightDelta(kmer ,pos, expectedWeight, actualWeight));
+					}
+				}
+			}
+		}
+		if (mismatches.size() > 0) {
+			for (KmerEvidence ke : evidenceTracker.getTrackedEvidence()) {
+				for (int i = 0; i < ke.length(); i++) {
+					KmerNode kn = ke.node(i);
+					if (kn != null) {
+						mismatches.forEach(mm -> {
+							if (mm.kmer == kn.lastKmer() && IntervalUtil.overlapsClosed(mm.pos, mm.pos, kn.firstStart(), kn.firstEnd())) {
+								mm.overlappingEvidence.add(ke);
+							}
+						});
+					}
+				}
+			}
+			mismatches.sort(Comparator.<KmerPosWeightDelta>comparingInt(x -> x.pos).thenComparingLong(x -> x.kmer));
+			throw new IllegalStateException("Kmer position weights do not match");
+		}
+		return true;
+	}
+	private static final Int2IntMap emptyi2i = new Int2IntOpenHashMap();
+	private Long2ObjectMap<Int2IntMap> subsetTo(Long2ObjectMap<Int2IntMap> expected, KmerPathNode key) {
+		Long2ObjectMap<Int2IntMap> subset = kmerPathNodeToKmerPosWeightLookup(ImmutableList.of(key));
+		// Remove all kmer in our subset that aren't in our expected set
+		Sets.difference(subset.keySet(), Sets.intersection(subset.keySet(), expected.keySet())).forEach(
+				kmer -> subset.remove((long)kmer)
+		);
+		subset.forEach((kmer, posWeightLookup) -> {
+			Int2IntMap expectedPosWeight = expected.getOrDefault((long) kmer, emptyi2i);
+			for (int pos : expectedPosWeight.keySet()) {
+				posWeightLookup.put(pos, expectedPosWeight.get(pos));
+			}
+		});
+		return subset;
+	}
+
 	public int tracking_activeNodes() {
 		return graphByPosition.size();
 	}

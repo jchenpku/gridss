@@ -43,10 +43,9 @@ import java.util.stream.Collectors;
 public class SAMEvidenceSource extends EvidenceSource {
 	private static final Log log = Log.getInstance(SAMEvidenceSource.class);
 	private final int sourceCategory;
-	private final ReadPairConcordanceMethod rpcMethod;
-	private final int rpcMinFragmentSize;
-	private final int rpcMaxFragmentSize;
-	private final double rpcConcordantPercentage;
+	private final Integer rpcMinFragmentSize;
+	private final Integer rpcMaxFragmentSize;
+	private final Double rpcConcordantPercentage;
 	private IdsvSamFileMetrics metrics;
 	private StructuralVariantReadMetrics svMetrics;
 	private ReadPairConcordanceCalculator rpcc;
@@ -55,19 +54,18 @@ public class SAMEvidenceSource extends EvidenceSource {
 		EvidenceStartPosition
 	}
 	public SAMEvidenceSource(ProcessingContext processContext, File file, File nameSorted, int sourceCategory) {
-		this(processContext, file, nameSorted, sourceCategory, ReadPairConcordanceMethod.SAM_FLAG, 0, 0, 0);
+		this(processContext, file, nameSorted, sourceCategory, null, null, null);
 	}
 	public SAMEvidenceSource(ProcessingContext processContext, File file, File nameSorted, int sourceCategory, int minFragmentSize, int maxFragmentSize) {
-		this(processContext, file, nameSorted, sourceCategory, ReadPairConcordanceMethod.FIXED, minFragmentSize, maxFragmentSize, 0);
+		this(processContext, file, nameSorted, sourceCategory, minFragmentSize, maxFragmentSize, null);
 	}
 	public SAMEvidenceSource(ProcessingContext processContext, File file, File nameSorted, int sourceCategory, double concordantPercentage) {
-		this(processContext, file, nameSorted, sourceCategory, ReadPairConcordanceMethod.PERCENTAGE, 0, 0, concordantPercentage);
+		this(processContext, file, nameSorted, sourceCategory, null, null, concordantPercentage);
 	}
 	protected SAMEvidenceSource(ProcessingContext processContext, File file, File nameSorted,
-			int sourceCategory, ReadPairConcordanceMethod rpcMethod, int rpcMinFragmentSize, int rpcMaxFragmentSize, double rpcConcordantPercentage) {
+			int sourceCategory, Integer rpcMinFragmentSize, Integer rpcMaxFragmentSize, Double rpcConcordantPercentage) {
 		super(processContext, file, nameSorted);
 		this.sourceCategory = sourceCategory;
-		this.rpcMethod = rpcMethod;
 		this.rpcMinFragmentSize = rpcMinFragmentSize;
 		this.rpcMaxFragmentSize = rpcMaxFragmentSize;
 		this.rpcConcordantPercentage = rpcConcordantPercentage;
@@ -182,14 +180,13 @@ public class SAMEvidenceSource extends EvidenceSource {
 									"UNMAPPED_READS=false", // saves intermediate file space
 									"METRICS_OUTPUT=" + getContext().getFileSystemContext().getSVMetrics(getFile()),
 									"MIN_CLIP_LENGTH=" + getContext().getConfig().getSoftClip().minLength,
-									"READ_PAIR_CONCORDANCE_METHOD=" + rpcMethod.name(),
-									"FIXED_READ_PAIR_CONCORDANCE_MIN_FRAGMENT_SIZE=" + rpcMinFragmentSize,
-									"FIXED_READ_PAIR_CONCORDANCE_MAX_FRAGMENT_SIZE=" + rpcMaxFragmentSize,
-									"READ_PAIR_CONCORDANT_PERCENT=" + rpcConcordantPercentage,
 									"INSERT_SIZE_METRICS=" + getContext().getFileSystemContext().getInsertSizeMetrics(getFile()),
 									// Picard tools does not mark duplicates correctly. We need to keep them so we can
 									// fix the duplicate marking in ComputeSamTags
 									"INCLUDE_DUPLICATES=true");
+							if (rpcMinFragmentSize != null) args.add("READ_PAIR_CONCORDANCE_MIN_FRAGMENT_SIZE=" + rpcMinFragmentSize);
+							if (rpcMaxFragmentSize != null) args.add("READ_PAIR_CONCORDANCE_MAX_FRAGMENT_SIZE=" + rpcMaxFragmentSize);
+							if (rpcConcordantPercentage != null) args.add("READ_PAIR_CONCORDANT_PERCENT=" + rpcConcordantPercentage);
 							execute(new ExtractSVReads(), args);
 						}
 						SAMFileUtil.sort(getContext().getFileSystemContext(), extractedFile, querysortedFile, SortOrder.queryname);
@@ -349,6 +346,10 @@ public class SAMEvidenceSource extends EvidenceSource {
 		}
 		if (r.getAttribute(SAMTag.SA.name()) != null) {
 			SAMSequenceDictionary dict = getContext().getDictionary();
+			// Need to keep track of original SA tag as if we unmap the primary alignment
+			// the supplementary alignment scoring will be inconsistent since it is based
+			// on the length of the primary alignment soft clip.
+			r.setTransientAttribute("OSA", r.getStringAttribute(SAMTag.SA.name()));
 			r.setAttribute(SAMTag.SA.name(), ChimericAlignment.getChimericAlignments(r).stream()
 					.filter(ca -> isInReference(r, ca, dict))
 					.filter(ca -> !getBlacklistedRegions().overlaps(
@@ -415,9 +416,6 @@ public class SAMEvidenceSource extends EvidenceSource {
 			return true;
 		}
 		if (getContext().isFilterDuplicates() && r.getDuplicateReadFlag()) {
-			return true;
-		}
-		if (SAMRecordUtil.isDovetailing(r, PairOrientation.FR, getContext().getConfig().dovetailMargin)) {
 			return true;
 		}
 		if (CigarUtil.widthOfImprecision(r.getCigar()) == 0) {
@@ -518,7 +516,11 @@ public class SAMEvidenceSource extends EvidenceSource {
 	}
 	public ReadPairConcordanceCalculator getReadPairConcordanceCalculator() {
 		if (rpcc == null) {
-			rpcc = ReadPairConcordanceCalculator.create(rpcMethod, rpcMinFragmentSize, rpcMaxFragmentSize, rpcConcordantPercentage, getMetrics().getInsertSizeDistribution(), getMetrics().getIdsvMetrics());
+			rpcc = ReadPairConcordanceCalculator.create(
+					rpcMinFragmentSize == null ? 0 : rpcMinFragmentSize,
+					rpcMaxFragmentSize == null ? 0 : rpcMaxFragmentSize,
+					rpcConcordantPercentage,
+					getMetrics().getInsertSizeDistribution(), getMetrics().getIdsvMetrics());
 		}
 		return rpcc;
 	}

@@ -1,9 +1,13 @@
-target
 .Rproj.user
+.idea
+.settings
+/example/*.log
+/example/out/
+target
 bin
 chr12.*
 hg19.*
 hg38.*
-.idea
-/example/*.log
-/example/out/
+BL21DE3_Genome.*
+C43DE3_Genome.*
+Escherichia_coli_bl21_de3_.ASM956v1.*

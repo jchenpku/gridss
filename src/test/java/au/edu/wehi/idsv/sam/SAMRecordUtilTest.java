@@ -6,22 +6,32 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
 
+import au.edu.wehi.idsv.*;
+import au.edu.wehi.idsv.picard.SynchronousReferenceLookupAdapter;
+import gridss.ComputeSamTags;
+import gridss.SanityCheckEvidence;
+import htsjdk.samtools.*;
+import htsjdk.samtools.reference.IndexedFastaSequenceFile;
 import htsjdk.samtools.util.SequenceUtil;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 
-import au.edu.wehi.idsv.TestHelper;
 import au.edu.wehi.idsv.picard.InMemoryReferenceSequenceFile;
-import htsjdk.samtools.SAMFileHeader;
-import htsjdk.samtools.SAMRecord;
-import htsjdk.samtools.SAMTag;
 import htsjdk.samtools.SamPairUtil.PairOrientation;
+import org.junit.experimental.categories.Category;
 
 
 public class SAMRecordUtilTest extends TestHelper {
@@ -577,16 +587,16 @@ public class SAMRecordUtilTest extends TestHelper {
 	}
 	@Test
 	public void calculateTemplateTags_SA_should_ignore_missing_NM() {
-		SAMRecord read0 = withMapq(10, withSequence("A", Read(0, 1, "1M5H")))[0];
+		SAMRecord read0 = withMapq(10, withSequence("ANNNNN", Read(0, 1, "1M5S")))[0];
 		SAMRecord read1 = withMapq(11, withSequence("C", Read(0, 2, "1H1M4H")))[0];
 		
 		read0.setAttribute("NM", null);
 		read1.setAttribute("NM", null);
 		
-		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(read0, read1), ImmutableSet.of(SAMTag.SA.name()), false, false, false, false, false,false);
+		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(read0, read1), ImmutableSet.of(SAMTag.SA.name()), false, false, false, true, false,false);
 		
 		assertEquals("polyA,2,+,1H1M4H,11,", read0.getStringAttribute("SA"));
-		assertEquals("polyA,1,+,1M5H,10,", read1.getStringAttribute("SA"));
+		assertEquals("polyA,1,+,1M5S,10,", read1.getStringAttribute("SA"));
 	}
 	@Test
 	public void calculateTemplateTags_SA_should_not_be_written_for_nonchimeric_reads() {
@@ -627,7 +637,7 @@ public class SAMRecordUtilTest extends TestHelper {
 		
 		read0.setSecondaryAlignment(true);
 		read1.setSecondaryAlignment(true);
-		read2.setSecondaryAlignment(true);
+		read2.setSecondaryAlignment(false);
 		read3.setSecondaryAlignment(true);
 		
 		read0.setAttribute("NM", 0);
@@ -635,7 +645,7 @@ public class SAMRecordUtilTest extends TestHelper {
 		read2.setAttribute("NM", 2);
 		read3.setAttribute("NM", 3);
 		
-		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(read0, read1, read2, read3, alt), ImmutableSet.of(SAMTag.SA.name()), false, false, false, false, false,false);
+		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(read0, read1, read2, read3, alt), ImmutableSet.of(SAMTag.SA.name()), false, false, false, true, false,false);
 		
 		assertEquals(null, alt.getStringAttribute("SA"));
 		// "0,4,+,3H1M2H,12,2,;0,1,+,1M5H,10,0,;0,2,+,1H1M4H,11,1,;0,5,+,4S2M,13,3,"
@@ -799,11 +809,11 @@ public class SAMRecordUtilTest extends TestHelper {
 	}
 	@Test
 	public void recalculateSupplementary_should_force_primary_to_supp() {
-		SAMRecord read0 = withMapq(10, withSequence("A", Read(0, 1, "1M5H")))[0];
+		SAMRecord read0 = withMapq(10, withSequence("ANNNNN", Read(0, 1, "1M5S")))[0];
 		SAMRecord read1 = withMapq(11, withSequence("C", Read(0, 2, "1H1M4H")))[0];
 		
 		read0.setAttribute("SA", "polyA,2,+,1H1M4H,11,0");
-		read1.setAttribute("SA", "polyA,1,+,1M5H,10,0");
+		read1.setAttribute("SA", "polyA,1,+,1M5S,10,0");
 		
 		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(read0, read1), ImmutableSet.of(), false, false, false, false, false,true);
 		
@@ -1004,6 +1014,41 @@ public class SAMRecordUtilTest extends TestHelper {
 		Assert.assertEquals("polyA,100,+,10M20S,10,0;polyA,200,+,10S10M10S,10,0", r3.getStringAttribute("SA"));
 	}
 	@Test
+	public void fixSA_should_consider_first_primary_record_as_primary() {
+		SAMRecord r1 = Read(0, 100, "10M20S");
+		SAMRecord r2 = Read(0, 200, "10S10M10S");
+		SAMRecord r3 = Read(0, 300, "20S10M");
+		r1.setAttribute("SA", new ChimericAlignment(r1).toString());
+		r2.setAttribute("SA", new ChimericAlignment(r1).toString());
+		r3.setAttribute("SA", new ChimericAlignment(r1).toString());
+		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(r1, r2, r3), ImmutableSet.of(SAMTag.SA.name()), false, false, false, true, false,true);
+		Assert.assertFalse(r1.getSupplementaryAlignmentFlag());
+		Assert.assertFalse(r1.isSecondaryAlignment());
+		Assert.assertTrue(r2.getSupplementaryAlignmentFlag());
+		Assert.assertFalse(r2.isSecondaryAlignment());
+		Assert.assertTrue(r3.getSupplementaryAlignmentFlag());
+		Assert.assertFalse(r3.isSecondaryAlignment());
+	}
+	@Test
+	public void fixSA_convert_overlapping_read_to_split_read_alignment() {
+		SAMRecord r1 = Read(0, 100, "70M30S");
+		SAMRecord r2 = Read(0, 200, "30S70M");
+		SAMRecordUtil.calculateTemplateTags(ImmutableList.of(r1, r2), ImmutableSet.of(SAMTag.SA.name()), false, false, false, true, false,true);
+		Assert.assertFalse(r1.getSupplementaryAlignmentFlag());
+		Assert.assertFalse(r1.isSecondaryAlignment());
+		Assert.assertTrue(r2.getSupplementaryAlignmentFlag());
+		Assert.assertFalse(r2.isSecondaryAlignment());
+		Assert.assertEquals("polyA,200,+,30S70M,10,0", r1.getStringAttribute("SA"));
+		Assert.assertEquals("polyA,100,+,70M30S,10,0", r2.getStringAttribute("SA"));
+	}
+	@Test
+	public void fixSA_should_remove_duplicate_alignments_starting_at_same_read_offset() {
+		SAMRecord r1 = Read(0, 100, "70M30S");
+		SAMRecord r2 = Read(0, 200, "50M50S");
+		ArrayList list = Lists.newArrayList(r1, r2);
+		SAMRecordUtil.calculateTemplateTags(list, ImmutableSet.of(SAMTag.SA.name()), false, false, false, true, false,true);
+	}
+	@Test
 	public void fixTruncated_should_add_hard_clipping_to_shorter_read_to_match_longer() {
 		// ACGTTTGGAAT
 		//    TTTGG
@@ -1076,6 +1121,139 @@ public class SAMRecordUtilTest extends TestHelper {
 		SAMRecordUtil.forceValidContigBounds(r, ref.getSequenceDictionary());
 		assertEquals(5, r.getAlignmentEnd());
 		assertEquals("3M3S", r.getCigarString());
+	}
+	//@Test
+	@Ignore("Handled downstream instead so the dovetailing check doesn't need to chase split read alignments")
+	public void isDovetailing_should_also_test_primary_alignment() throws CloneNotSupportedException {
+		SAMRecord[] rp = RP(2, 100, 100, 100);
+		rp[0].setCigarString("75M25S");
+		rp[1].setCigarString("25S75M");
+		rp[0].setAttribute("MC", rp[1].getCigarString());
+		rp[1].setAttribute("MC", rp[0].getCigarString());
+		SAMRecord supp = (SAMRecord) rp[0].clone();
+		supp.setSupplementaryAlignmentFlag(true);
+		supp.setAlignmentStart(200);
+		supp.setCigarString("75S25M");
+		supp.setAttribute("SA", new ChimericAlignment(rp[0]).toString());
+		rp[0].setAttribute("SA", new ChimericAlignment(supp).toString());
+		Assert.assertTrue(SAMRecordUtil.isDovetailing(rp[0], PairOrientation.FR, 0));
+		Assert.assertTrue(SAMRecordUtil.isDovetailing(supp, PairOrientation.FR, 0));
+	}
+	@Test
+	public void fixMate_should_set_to_primary() throws CloneNotSupportedException {
+		SAMRecord[] rp = RP(2, 100, 100, 100);
+		rp[0].setCigarString("75M25S");
+		rp[1].setCigarString("25S75M");
+		SAMRecord[] supp = new SAMRecord[] { (SAMRecord)rp[0].clone(), (SAMRecord)rp[1].clone()};
+		supp[0].setSupplementaryAlignmentFlag(true);
+		supp[1].setSupplementaryAlignmentFlag(true);
+		supp[0].setAlignmentStart(200);
+		supp[1].setAlignmentStart(300);
+		supp[0].setCigarString("60S40M");
+		supp[1].setCigarString("10M90S");
+
+		rp[0].setMappingQuality(11);
+		rp[1].setMappingQuality(12);
+		supp[0].setMappingQuality(13);
+		supp[1].setMappingQuality(14);
+		rp[0].setAttribute("SA", new ChimericAlignment(supp[0]).toString());
+		rp[1].setAttribute("SA", new ChimericAlignment(supp[1]).toString());
+		supp[0].setAttribute("SA", new ChimericAlignment(rp[0]).toString());
+		supp[1].setAttribute("SA", new ChimericAlignment(rp[1]).toString());
+
+		List<List<SAMRecord>> fragment = Lists.newArrayList(
+				Lists.newArrayList(supp[0], rp[0]),
+				Lists.newArrayList(supp[1], rp[1]));
+		SAMRecordUtil.fixMates(fragment, true, true);
+
+		Assert.assertEquals("25S75M", rp[0].getStringAttribute("MC"));
+		Assert.assertEquals("75M25S", rp[1].getStringAttribute("MC"));
+		Assert.assertEquals("25S75M", supp[0].getStringAttribute("MC"));
+		Assert.assertEquals("75M25S", supp[1].getStringAttribute("MC"));
+
+		Assert.assertEquals(12, (int)rp[0].getIntegerAttribute("MQ"));
+		Assert.assertEquals(11, (int)rp[1].getIntegerAttribute("MQ"));
+		Assert.assertEquals(12, (int)supp[0].getIntegerAttribute("MQ"));
+		Assert.assertEquals(11, (int)supp[1].getIntegerAttribute("MQ"));
+	}
+	@Test
+	public void matchReadPairPrimaryAlignments_should_pair_primaries() throws CloneNotSupportedException {
+		SAMRecord[] rp = RP(2, 100, 100, 100);
+		rp[0].setCigarString("75M25S");
+		rp[1].setCigarString("25S75M");
+		SAMRecord[] supp = new SAMRecord[] { (SAMRecord)rp[0].clone(), (SAMRecord)rp[1].clone()};
+		supp[0].setSupplementaryAlignmentFlag(true);
+		supp[1].setSupplementaryAlignmentFlag(true);
+		supp[0].setAlignmentStart(200);
+		supp[1].setAlignmentStart(300);
+		supp[0].setCigarString("60S40M");
+		supp[1].setCigarString("10M90S");
+
+		rp[0].setMappingQuality(11);
+		rp[1].setMappingQuality(12);
+		supp[0].setMappingQuality(13);
+		supp[1].setMappingQuality(14);
+		rp[0].setAttribute("SA", new ChimericAlignment(supp[0]).toString());
+		rp[1].setAttribute("SA", new ChimericAlignment(supp[1]).toString());
+		supp[0].setAttribute("SA", new ChimericAlignment(rp[0]).toString());
+		supp[1].setAttribute("SA", new ChimericAlignment(rp[1]).toString());
+
+		SamPairUtil.setMateInfo(rp[0], supp[1], true);
+		SamPairUtil.setMateInfo(rp[1], supp[0], true);
+
+		List<List<SAMRecord>> fragment = Lists.newArrayList(
+				Lists.newArrayList(supp[0], rp[0]),
+				Lists.newArrayList(supp[1], rp[1]));
+		SAMRecordUtil.matchReadPairPrimaryAlignments(fragment);
+
+		Assert.assertEquals("25S75M", rp[0].getStringAttribute("MC"));
+		Assert.assertEquals("75M25S", rp[1].getStringAttribute("MC"));
+
+		Assert.assertEquals(12, (int)rp[0].getIntegerAttribute("MQ"));
+		Assert.assertEquals(11, (int)rp[1].getIntegerAttribute("MQ"));
+	}
+	@Test
+	@Category(EColiTests.class)
+	public void issue278_inconsistent_read_pair() throws FileNotFoundException {
+		File ref = ReferenceTests.findReference("Escherichia_coli_bl21_de3_.ASM956v1.dna.toplevel.fa");
+		SynchronousReferenceLookupAdapter reflookup = new SynchronousReferenceLookupAdapter(new IndexedFastaSequenceFile(ref));
+		File input = new File("src/test/resources/sanity_failure_debug/bl21_de3_.ASM956v1_S2.bam");
+		ProcessingContext pc = new ProcessingContext(new FileSystemContext(input.getParentFile(), input.getParentFile(), SAMFileWriterImpl.getDefaultMaxRecordsInRam()), ref, reflookup, null, getConfig());
+		List<SAMRecord> results = Lists.newArrayList(new TemplateTagsIterator(Lists.newArrayList(getRecords(input)).iterator(), true, true, true, true, true, true, ImmutableSet.of(SAMTag.MC.name(), SAMTag.MQ.name())));
+		List<SAMRecord> primary = results.stream().filter(r -> !r.isSecondaryOrSupplementary()).collect(Collectors.toList());
+		assertEquals(primary.get(0).getCigarString(), primary.get(1).getStringAttribute("MC"));
+		assertEquals(primary.get(1).getCigarString(), primary.get(0).getStringAttribute("MC"));
+	}
+	@Test
+	@Category(EColiTests.class)
+	public void issue278_inconsistent_assembly_scoring() throws IOException {
+		File ref = ReferenceTests.findReference("Escherichia_coli_bl21_de3_.ASM956v1.dna.toplevel.fa");
+		SynchronousReferenceLookupAdapter reflookup = new SynchronousReferenceLookupAdapter(new IndexedFastaSequenceFile(ref));
+		File input = new File("src/test/resources/sanity_failure_debug/bl21_de3_.ASM956v1_assembly.bam");
+		ProcessingContext pc = new ProcessingContext(new FileSystemContext(input.getParentFile(), input.getParentFile(), SAMFileWriterImpl.getDefaultMaxRecordsInRam()), ref, reflookup, null, getConfig());
+		List<SAMRecord> records = getRecords(input).stream()
+				.filter(r -> r.getReadName().equals("asm0-758922"))
+				.collect(Collectors.toList());
+		MockSAMEvidenceSource ses = SES(pc);
+		List<DirectedBreakpoint> evidence = records.stream()
+				.flatMap(r -> SingleReadEvidence.createEvidence(ses, 0, r).stream())
+				.filter(r -> r instanceof DirectedBreakpoint)
+				.map(r -> (DirectedBreakpoint)r)
+				.collect(Collectors.toList());
+		Assert.assertEquals(evidence.get(0).getBreakpointQual(), evidence.get(1).getBreakpointQual(), 0);
+	}
+	@Test
+	public void fixMate_should_not_match_to_supplementary_if_primary_exists() throws CloneNotSupportedException {
+		SAMRecord[] rp = RP(0, 100, 200, 10);
+		SAMRecord primary = (SAMRecord)rp[1].clone();
+		rp[1].setSupplementaryAlignmentFlag(true);
+		primary.setAlignmentStart(300);
+		primary.getMateUnmappedFlag();
+		primary.setMateAlignmentStart(SAMRecord.NO_ALIGNMENT_START);
+		primary.setMateReferenceIndex(SAMRecord.NO_ALIGNMENT_REFERENCE_INDEX);
+
+		SAMRecordUtil.fixMates(ImmutableList.of(Lists.newArrayList(rp[0]), Lists.newArrayList(rp[1], primary)), true, true);
+		assertEquals(primary.getAlignmentStart(), rp[0].getMateAlignmentStart());
 	}
 }
 

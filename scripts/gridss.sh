@@ -33,11 +33,14 @@ Usage: gridss.sh --reference <reference.fa> --output <output.vcf.gz> --assembly 
 	--jvmheap: size of JVM heap for assembly and variant calling. Defaults to 27.5g to ensure GRIDSS runs on all cloud instances with approximate 32gb memory including DNANexus azure:mem2_ssd1_x8.
 	--maxcoverage: maximum coverage. Regions with coverage in excess of this are ignored.
 	--picardoptions: additional standard Picard command line options. Useful options include VALIDATION_STRINGENCY=LENIENT and COMPRESSION_LEVEL=0. See https://broadinstitute.github.io/picard/command-line-overview.html
+	--useproperpair: use SAM 'proper pair' flag to determine whether a read pair is discordant. Default: use library fragment size distribution to determine read pair concordance
+	--concordantreadpairdistribution: portion of 6 sigma read pairs distribution considered concordantly mapped. Default: 0.995
+	--keepTempFiles: keep intermediate files. Not recommended except for debugging due to the high disk usage.
 	"
-	
+
 
 OPTIONS=r:o:a:t:j:w:b:s:c:l:
-LONGOPTS=reference:,output:,assembly:,threads:,jar:,workingdir:,jvmheap:,blacklist:,steps:,configuration:,maxcoverage:,labels:,picardoptions:,jobindex:,jobnodes:
+LONGOPTS=reference:,output:,assembly:,threads:,jar:,workingdir:,jvmheap:,blacklist:,steps:,configuration:,maxcoverage:,labels:,picardoptions:,jobindex:,jobnodes:,useproperpair,concordantreadpairdistribution:,keepTempFiles,sanityCheck
 ! PARSED=$(getopt --options=$OPTIONS --longoptions=$LONGOPTS --name "$0" -- "$@")
 if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
     # e.g. return value is 1
@@ -61,6 +64,10 @@ labels=""
 picardoptions=""
 jobindex="0"
 jobnodes="1"
+useproperpair="false"
+readpairpdistribution="0.995"
+keepTempFiles="false"
+sanityCheck="false"
 while true; do
     case "$1" in
         -r|--reference)
@@ -123,6 +130,22 @@ while true; do
 		--jobnodes)
 			jobnodes=$2
 			shift 2
+			;;
+		--concordantreadpairdistribution)
+			readpairpdistribution=$2
+			shift 2
+			;;
+		--useproperpair)
+			useproperpair="true"
+			shift 1
+			;;
+		--keepTempFiles)
+			keepTempFiles="true"
+			shift 1
+			;;
+		--sanityCheck)
+			sanityCheck="true"
+			shift 1
 			;;
 		--)
             shift
@@ -373,12 +396,29 @@ if [[ $do_call == "true" ]] ; then
 fi
 echo ". The full log is in $logfile" 2>&1 
 
-jvm_args="
+# For debugging purposes, we want to keep all our 
+if [[ $keepTempFiles == "true" ]] ; then
+	rmcmd="echo rm"
+	jvm_args="-Dgridss.keepTempFiles=true"
+else
+	rmcmd="rm"
+	jvm_args=""
+fi
+
+jvm_args="$jvm_args \
 	-Dreference_fasta=$reference \
 	-Dsamjdk.use_async_io_read_samtools=true \
 	-Dsamjdk.use_async_io_write_samtools=true \
 	-Dsamjdk.use_async_io_write_tribble=true \
 	-Dsamjdk.buffer_size=4194304"
+
+readpairing_args=""
+
+READ_PAIR_CONCORDANT_PERCENT="$readpairpdistribution"
+if [[ "$useproperpair" == "true" ]] ; then
+	readpairing_args="READ_PAIR_CONCORDANT_PERCENT=null"
+fi
+
 
 if [[ $do_preprocess == true ]] ; then
 	if [[ "$jobnodes" != "1" ]] ; then
@@ -433,6 +473,7 @@ if [[ $do_preprocess == true ]] ; then
 					COMPRESSION_LEVEL=0 \
 					METRICS_OUTPUT=$prefix.sv_metrics \
 					INSERT_SIZE_METRICS=$tmp_prefix.insert_size_metrics \
+					$readpairing_args \
 					UNMAPPED_READS=false \
 					MIN_CLIP_LENGTH=5 \
 					INCLUDE_DUPLICATES=true \
@@ -445,7 +486,9 @@ if [[ $do_preprocess == true ]] ; then
 					-@ $threads \
 					/dev/stdin \
 			; } 1>&2 2>> $logfile
-			rm $tmp_prefix.insert_size_metrics $tmp_prefix.insert_size_histogram.pdf
+			if [[ -f $tmp_prefix.insert_size_metrics ]] ; then
+				$rmcmd $tmp_prefix.insert_size_metrics $tmp_prefix.insert_size_histogram.pdf
+			fi
 			echo "$(date)	ComputeSamTags|samtools	$f" | tee -a $timinglogfile
 			{ $timecmd java -Xmx4g $jvm_args \
 					-cp $gridss_jar gridss.ComputeSamTags \
@@ -477,7 +520,7 @@ if [[ $do_preprocess == true ]] ; then
 					-@ $threads \
 					/dev/stdin \
 			; } 1>&2 2>> $logfile
-			rm $tmp_prefix.namedsorted.bam
+			$rmcmd $tmp_prefix.namedsorted.bam
 			echo "$(date)	SoftClipsToSplitReads	$f" | tee -a $timinglogfile
 			{ $timecmd java -Xmx4g $jvm_args \
 					-Dsamjdk.create_index=false \
@@ -491,22 +534,22 @@ if [[ $do_preprocess == true ]] ; then
 					OUTPUT_UNORDERED_RECORDS=$tmp_prefix.sc2sr.supp.sv.bam \
 					WORKER_THREADS=$threads \
 					$picardoptions \
-			&& rm $tmp_prefix.coordinate.bam \
+			&& $rmcmd $tmp_prefix.coordinate.bam \
 			&& $timecmd samtools sort \
 					-@ $threads \
 					-T $tmp_prefix.sc2sr.suppsorted.sv-tmp \
 					-Obam \
 					-o $tmp_prefix.sc2sr.suppsorted.sv.bam \
 					$tmp_prefix.sc2sr.supp.sv.bam \
-			&& rm $tmp_prefix.sc2sr.supp.sv.bam \
+			&& $rmcmd $tmp_prefix.sc2sr.supp.sv.bam \
 			&& $timecmd samtools merge \
 					-@ $threads \
 					$prefix.sv.tmp.bam \
 					$tmp_prefix.sc2sr.primary.sv.bam \
 					$tmp_prefix.sc2sr.suppsorted.sv.bam \
 			&& $timecmd samtools index $prefix.sv.tmp.bam \
-			&& rm $tmp_prefix.sc2sr.primary.sv.bam \
-			&& rm $tmp_prefix.sc2sr.suppsorted.sv.bam \
+			&& $rmcmd $tmp_prefix.sc2sr.primary.sv.bam \
+			&& $rmcmd $tmp_prefix.sc2sr.suppsorted.sv.bam \
 			&& mv $prefix.sv.tmp.bam $prefix.sv.bam \
 			&& mv $prefix.sv.tmp.bam.bai $prefix.sv.bam.bai \
 			; } 1>&2 2>> $logfile
@@ -518,7 +561,21 @@ if [[ $do_preprocess == true ]] ; then
 else
 	echo "$(date)	Skipping pre-processing."
 fi
-
+if [[ $sanityCheck == "true" ]] ; then 
+	echo "$(date)	Sanity checking *.sv.bam"
+	java -Xmx$jvmheap $jvm_args \
+		-cp $gridss_jar gridss.SanityCheckEvidence \
+		TMP_DIR=$workingdir \
+		WORKING_DIR=$workingdir \
+		REFERENCE_SEQUENCE=$reference \
+		WORKER_THREADS=$threads \
+		$input_args \
+		$blacklist_arg \
+		$config_args \
+		ASSEMBLY=ignored \
+		OUTPUT_ERROR_READ_NAMES=reads_failing_sanity_check.txt \
+		1>&2 2>> $logfile
+fi
 if [[ $do_assemble == true ]] ; then
 	echo "$(date)	Start assembly	$assembly" | tee -a $timinglogfile
 	if [[ ! -f $assembly ]] ; then
@@ -537,6 +594,7 @@ if [[ $do_assemble == true ]] ; then
 				$blacklist_arg \
 				$config_args \
 				$picardoptions \
+				$readpairing_args \
 		; } 1>&2 2>> $logfile
 	else
 		echo "$(date)	Skipping assembly as $assembly already exists.	$assembly"
@@ -555,6 +613,7 @@ if [[ $do_assemble == true ]] ; then
 				-cp $gridss_jar gridss.analysis.CollectGridssMetrics \
 				I=$assembly \
 				O=$prefix \
+				REFERENCE_SEQUENCE=$reference \
 				THRESHOLD_COVERAGE=$maxcoverage \
 				TMP_DIR=$workingdir \
 				FILE_EXTENSION=null \
@@ -565,7 +624,7 @@ if [[ $do_assemble == true ]] ; then
 				GRIDSS_PROGRAM=CollectIdsvMetrics \
 				GRIDSS_PROGRAM=ReportThresholdCoverage \
 				PROGRAM=null \
-				PROGRAM=CollectAlignmentSummaryMetrics \
+				PROGRAM=QualityScoreDistribution \
 				$picardoptions \
 		; } 1>&2 2>> $logfile
 		echo "$(date)	SoftClipsToSplitReads	$assembly" | tee -a $timinglogfile
@@ -589,15 +648,15 @@ if [[ $do_assemble == true ]] ; then
 				-Obam \
 				-o $tmp_prefix.sc2sr.suppsorted.sv.bam \
 				$tmp_prefix.sc2sr.supp.sv.bam \
-		&& rm $tmp_prefix.sc2sr.supp.sv.bam \
+		&& $rmcmd $tmp_prefix.sc2sr.supp.sv.bam \
 		&& $timecmd samtools merge \
 				-@ $threads \
 				$prefix.sv.tmp.bam \
 				$tmp_prefix.sc2sr.primary.sv.bam \
 				$tmp_prefix.sc2sr.suppsorted.sv.bam \
 		&& $timecmd samtools index $prefix.sv.tmp.bam \
-		&& rm $tmp_prefix.sc2sr.primary.sv.bam \
-		&& rm $tmp_prefix.sc2sr.suppsorted.sv.bam \
+		&& $rmcmd $tmp_prefix.sc2sr.primary.sv.bam \
+		&& $rmcmd $tmp_prefix.sc2sr.suppsorted.sv.bam \
 		&& mv $prefix.sv.tmp.bam $prefix.sv.bam \
 		&& mv $prefix.sv.tmp.bam.bai $prefix.sv.bam.bai \
 		; } 1>&2 2>> $logfile
@@ -605,6 +664,20 @@ if [[ $do_assemble == true ]] ; then
 	echo "$(date)	Complete assembly	$assembly"
 else
 	echo "$(date)	Skipping assembly	$assembly"
+fi
+if [[ $sanityCheck == "true" ]] ; then 
+	java -Xmx$jvmheap $jvm_args \
+		-cp $gridss_jar gridss.SanityCheckEvidence \
+		TMP_DIR=$workingdir \
+		WORKING_DIR=$workingdir \
+		REFERENCE_SEQUENCE=$reference \
+		WORKER_THREADS=$threads \
+		$input_args \
+		$blacklist_arg \
+		$config_args \
+		ASSEMBLY=$assembly \
+		$readpairing_args \
+		OUTPUT_ERROR_READ_NAMES=reads_failing_sanity_check.txt
 fi
 if [[ $do_call == true ]] ; then
 	echo "$(date)	Start calling	$output_vcf" | tee -a $timinglogfile
@@ -633,6 +706,7 @@ if [[ $do_call == true ]] ; then
 				$config_args \
 				ASSEMBLY=$assembly \
 				OUTPUT_VCF=$prefix.unallocated.vcf \
+				$readpairing_args \
 		; } 1>&2 2>> $logfile
 		echo "$(date)	AnnotateVariants	$output_vcf" | tee -a $timinglogfile
 		{ $timecmd java -Xmx$jvmheap $jvm_args \
@@ -649,8 +723,9 @@ if [[ $do_call == true ]] ; then
 				INPUT_VCF=$prefix.unallocated.vcf \
 				OUTPUT_VCF=$prefix.allocated.vcf \
 				$picardoptions \
+				$readpairing_args \
 		; } 1>&2 2>> $logfile
-		rm $prefix.unallocated.vcf
+		$rmcmd $prefix.unallocated.vcf
 		echo "$(date)	AnnotateUntemplatedSequence	$output_vcf" | tee -a $timinglogfile
 		{ $timecmd java -Xmx4g $jvm_args \
 				-Dgridss.output_to_temp_file=true \
@@ -663,7 +738,7 @@ if [[ $do_call == true ]] ; then
 				OUTPUT=$output_vcf \
 				$picardoptions \
 		; } 1>&2 2>> $logfile
-		rm $prefix.allocated.vcf
+		$rmcmd $prefix.allocated.vcf
 	else
 		echo "$(date)	Skipping variant calling	$output_vcf"
 	fi
